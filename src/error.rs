@@ -14,6 +14,12 @@ pub enum Error {
 
     #[from]
     JsonWebTokenError(jsonwebtoken::errors::Error),
+
+    #[from]
+    UuidError(uuid::Error),
+
+    #[from]
+    FmtError(std::fmt::Error),
 }
 
 impl Error {
@@ -35,3 +41,7 @@ impl core::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+#[path = "tests/test_error.rs"]
+mod test_error;
