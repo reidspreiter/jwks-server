@@ -20,6 +20,9 @@ pub enum Error {
 
     #[from]
     FmtError(std::fmt::Error),
+
+    #[from]
+    SqliteError(rusqlite::Error),
 }
 
 impl Error {

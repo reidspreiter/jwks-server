@@ -3,7 +3,10 @@ use actix_web::{http::StatusCode, test as web_test};
 
 #[actix_web::test]
 async fn test_jwks_endpoint_err_codes() {
-    let app = web_test::init_service(App::new().configure(configure_app)).await;
+    let keygen = Arc::new(KeyGen::new(true).unwrap());
+    let app =
+        web_test::init_service(App::new().configure(|cfg| configure_app(cfg, keygen.clone())))
+            .await;
     let uri = "/.well-known/jwks.json";
     let req = web_test::TestRequest::get().uri(uri).to_request();
 
@@ -32,7 +35,10 @@ async fn test_jwks_endpoint_err_codes() {
 
 #[actix_web::test]
 async fn test_auth_endpoint_err_codes() {
-    let app = web_test::init_service(App::new().configure(configure_app)).await;
+    let keygen = Arc::new(KeyGen::new(true).unwrap());
+    let app =
+        web_test::init_service(App::new().configure(|cfg| configure_app(cfg, keygen.clone())))
+            .await;
     let uri = "/auth";
     let req = web_test::TestRequest::post().uri(uri).to_request();
 
@@ -57,4 +63,24 @@ async fn test_auth_endpoint_err_codes() {
             resp.status()
         );
     }
+}
+
+#[actix_web::test]
+async fn test_endpoint_err_cases() {
+    let keygen = Arc::new(KeyGen::new(false).unwrap());
+    let app =
+        web_test::init_service(App::new().configure(|cfg| configure_app(cfg, keygen.clone())))
+            .await;
+
+    let uri = "/auth";
+    let req = web_test::TestRequest::post().uri(uri).to_request();
+
+    let resp = web_test::call_service(&app, req).await;
+    assert!(resp.status().is_server_error(), "Got auth success when should have gotten server error");
+
+    // let uri = "/.well-known/jwks.json";
+    // let req = web_test::TestRequest::get().uri(uri).to_request();
+
+    // let resp = web_test::call_service(&app, req).await;
+    // assert!(resp.status().is_server_error(), "Got jwks success when should have gotten server error");
 }

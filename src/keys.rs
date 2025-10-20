@@ -9,18 +9,16 @@ use jsonwebtoken::{
     },
 };
 use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    pkcs1::{EncodeRsaPrivateKey, LineEnding},
+    RsaPrivateKey,
+    pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, LineEnding},
     traits::PublicKeyParts,
 };
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use uuid::Uuid;
 
-macro_rules! now_usize {
-    () => {
-        chrono::Utc::now().timestamp() as usize
-    };
+fn minutes_from_now(minutes: i64) -> i64 {
+    let now = Utc::now();
+    (now - Duration::minutes(minutes)).timestamp()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,113 +28,135 @@ struct Claims {
     iat: usize,
 }
 
-#[derive(Debug)]
-struct RsaKeyPair {
-    kid: Uuid,
-    exp: usize,
-    private_key: RsaPrivateKey,
-    public_key: RsaPublicKey,
+#[derive(Clone)]
+struct KeyRow {
+    kid: i64,
+    key: RsaPrivateKey,
+    exp: i64,
 }
 
 pub struct KeyGen {
-    rsa_keys: HashMap<Uuid, RsaKeyPair>,
-}
-
-fn minutes_from_now(minutes: i64) -> usize {
-    let now = Utc::now();
-    (now - Duration::minutes(minutes)).timestamp() as usize
+    db_path: &'static str,
 }
 
 impl KeyGen {
-    pub fn new() -> Result<Self> {
-        let mut rsa_keys: HashMap<Uuid, RsaKeyPair> = HashMap::new();
-        let private_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048)?;
-        let public_key = RsaPublicKey::from(&private_key);
-        let uuid = Uuid::new_v4();
-        rsa_keys.insert(
-            uuid,
-            RsaKeyPair {
-                kid: uuid,
-                exp: minutes_from_now(30),
-                private_key,
-                public_key,
-            },
-        );
+    fn get_keys(&self, expired: bool) -> Result<Vec<KeyRow>> {
+        let now = Utc::now().timestamp();
+        let conn = Connection::open(self.db_path)?;
 
-        let exp_private_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048)?;
-        let exp_public_key = RsaPublicKey::from(&exp_private_key);
-        let exp_uuid = Uuid::new_v4();
-        rsa_keys.insert(
-            exp_uuid,
-            RsaKeyPair {
-                kid: exp_uuid,
-                exp: minutes_from_now(-30),
-                private_key: exp_private_key,
-                public_key: exp_public_key,
-            },
-        );
+        let mut stmt = conn.prepare(
+            "SELECT kid, key, exp FROM keys WHERE CASE WHEN ?1 THEN exp <= ?2 ELSE exp > ?2 END",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![expired, now], |row| {
+            let kid: i64 = row.get(0)?;
+            let key_blob: Vec<u8> = row.get(1)?;
+            let exp: i64 = row.get(2)?;
 
-        Ok(KeyGen { rsa_keys })
-    }
+            let key = RsaPrivateKey::from_pkcs1_der(&key_blob).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Blob,
+                    Box::new(e),
+                )
+            })?;
+            Ok(KeyRow { kid, key, exp })
+        })?;
 
-    pub fn get_jwks(&self) -> JwkSet {
-        let mut jwks = JwkSet { keys: Vec::new() };
-        let now = now_usize!();
-        for key_pair in self.rsa_keys.values() {
-            if key_pair.exp > now {
-                let n = key_pair.public_key.n().to_bytes_be();
-                let e = key_pair.public_key.e().to_bytes_be();
-
-                jwks.keys.push(Jwk {
-                    common: CommonParameters {
-                        public_key_use: Some(PublicKeyUse::Signature),
-                        key_algorithm: Some(KeyAlgorithm::RS256),
-                        key_id: Some(key_pair.kid.to_string()),
-                        key_operations: None,
-                        x509_url: None,
-                        x509_chain: None,
-                        x509_sha1_fingerprint: None,
-                        x509_sha256_fingerprint: None,
-                    },
-                    algorithm: AlgorithmParameters::RSA(RSAKeyParameters {
-                        key_type: RSAKeyType::RSA,
-                        n: b64encode(&n),
-                        e: b64encode(&e),
-                    }),
-                });
-            }
+        let mut keys = Vec::new();
+        for key in rows {
+            keys.push(key?);
         }
-        jwks
+
+        Ok(keys)
     }
 
-    pub fn generate_jwt(&self, expired: Option<bool>) -> Result<String> {
-        let _expired = expired.unwrap_or(false);
+    pub fn generate_new_rsa(&self, exp_minutes: i64) -> Result<()> {
+        let key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048)?;
+        let conn = Connection::open(self.db_path)?;
+        conn.execute(
+            "INSERT INTO keys (key, exp) VALUES (?, ?)",
+            (
+                key.to_pkcs1_der()?.as_bytes(),
+                minutes_from_now(exp_minutes),
+            ),
+        )?;
+        Ok(())
+    }
 
-        let iat = now_usize!();
-        let key_pair = match self
-            .rsa_keys
-            .values()
-            .into_iter()
-            .find(|&x| !(_expired ^ (x.exp < iat)))
-        {
-            Some(p) => p,
-            None => {
-                return Err(Error::Custom(String::from(
-                    "Could not find key with matching expiration",
-                )));
-            }
-        };
+    pub fn new(initialize_keys: bool) -> Result<Self> {
+        let db_path = "totally_not_my_privateKeys.db";
+        let conn = Connection::open(db_path)?;
+
+        conn.execute("DROP TABLE IF EXISTS keys", ())?;
+        conn.execute(
+            "CREATE TABLE keys(
+                kid INTEGER PRIMARY KEY AUTOINCREMENT,
+                key BLOB NOT NULL,
+                exp INTEGER NOT NULL
+            )",
+            (),
+        )?;
+
+        let keygen = KeyGen { db_path };
+
+        log::info!("Initializing keys...");
+        if initialize_keys {
+            keygen.generate_new_rsa(120)?;
+            keygen.generate_new_rsa(-120)?;
+        }
+
+        Ok(keygen)
+    }
+
+    pub fn get_jwks(&self) -> Result<JwkSet> {
+        let mut jwks = JwkSet { keys: Vec::new() };
+
+        for key in self.get_keys(false)? {
+            let pub_key = key.key.to_public_key();
+            let n = pub_key.n().to_bytes_be();
+            let e = pub_key.e().to_bytes_be();
+
+            jwks.keys.push(Jwk {
+                common: CommonParameters {
+                    public_key_use: Some(PublicKeyUse::Signature),
+                    key_algorithm: Some(KeyAlgorithm::RS256),
+                    key_id: Some(key.kid.to_string()),
+                    key_operations: None,
+                    x509_url: None,
+                    x509_chain: None,
+                    x509_sha1_fingerprint: None,
+                    x509_sha256_fingerprint: None,
+                },
+                algorithm: AlgorithmParameters::RSA(RSAKeyParameters {
+                    key_type: RSAKeyType::RSA,
+                    n: b64encode(&n),
+                    e: b64encode(&e),
+                }),
+            });
+        }
+        Ok(jwks)
+    }
+
+    pub fn generate_jwt(&self, expired: bool) -> Result<String> {
+        let iat = Utc::now().timestamp() as usize;
+
+        let keys = self.get_keys(expired)?;
+        let key = keys
+            .get(0)
+            .ok_or_else(|| Error::Custom(String::from("Found no keys")))?;
 
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(key_pair.kid.to_string());
+        header.kid = Some(key.kid.to_string());
         header.typ = Some(String::from("JWT"));
 
         let claims = Claims {
-            exp: key_pair.exp,
+            exp: key.exp as usize,
             alg: String::from("RS256"),
             iat,
         };
-        let pem = key_pair.private_key.to_pkcs1_pem(LineEnding::LF)?;
+
+        let pem = key.key.to_pkcs1_pem(LineEnding::LF)?;
+
         let token = encode(
             &header,
             &claims,

@@ -8,8 +8,21 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 async fn get_jwks(keygen: web::Data<Arc<KeyGen>>) -> ActixResult<impl Responder> {
-    let jwks = keygen.get_jwks();
-    Ok(HttpResponse::Ok().json(jwks))
+    let result = web::block(move || {
+        keygen.get_jwks()
+    }).await;
+
+    match result {
+        Ok(Ok(jwks)) => Ok(HttpResponse::Ok().json(jwks)),
+        Ok(Err(e)) => {
+            error!("Error generating jwks: {e}");
+            Ok(HttpResponse::InternalServerError().json("Error generating jwks"))
+        },
+        Err(e) => {
+            error!("Blocking error: {e}");
+            Ok(HttpResponse::InternalServerError().json("Error generating jwks"))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -26,17 +39,25 @@ async fn auth(
     keygen: web::Data<Arc<KeyGen>>,
     query: web::Query<AuthQueryParams>,
 ) -> ActixResult<impl Responder> {
-    match keygen.generate_jwt(Some(query.expired == Some(String::from("true")))) {
-        Ok(jwt) => Ok(HttpResponse::Ok().json(AuthResponse { jwt })),
-        Err(e) => {
+    let result = web::block(move || {
+        keygen.generate_jwt(query.expired == Some(String::from("true")))
+    }).await;
+
+    match result {
+        Ok(Ok(jwt)) => Ok(HttpResponse::Ok().json(AuthResponse { jwt })),
+        Ok(Err(e)) => {
             error!("Error generating jwt: {e}");
+            Ok(HttpResponse::InternalServerError().json("Error generating jwt"))
+        }
+        Err(e) => {
+            error!("Blocking error: {e}");
             Ok(HttpResponse::InternalServerError().json("Error generating jwt"))
         }
     }
 }
 
-fn configure_app(cfg: &mut web::ServiceConfig) {
-    cfg.app_data(web::Data::new(Arc::new(KeyGen::new().unwrap())))
+fn configure_app(cfg: &mut web::ServiceConfig, keygen: Arc<KeyGen>) {
+    cfg.app_data(web::Data::new(keygen))
         .service(web::resource("/auth").route(web::post().to(auth)))
         .service(web::resource("/.well-known/jwks.json").route(web::get().to(get_jwks)));
 }
@@ -47,11 +68,15 @@ async fn main() -> std::io::Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
+    let keygen = Arc::new(KeyGen::new(true).unwrap());
+
     info!("Starting jwks server...");
-    HttpServer::new(move || App::new().configure(configure_app))
-        .bind(("127.0.0.1", 8080))?
-        .run()
-        .await
+    HttpServer::new(move || {
+        App::new().configure(|cfg| configure_app(cfg, keygen.clone()))
+    })
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
 }
 
 #[cfg(test)]
